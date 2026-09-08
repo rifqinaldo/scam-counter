@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import './index.css';
-import { db, ref, onValue, set } from './firebase';
+import { fetchLiveData, pushLiveData } from './syncService';
 
 const EMOJI_POOL = [
   '🦊', '👺', '😈', '🤡', '🦁', '🐼', '🤖', '🐙', 
@@ -62,7 +62,7 @@ function App() {
     Rifqi: 0, Ilham: 0, Jonathan: 0, Fatwa: 0, Agung: 0, Dini: 0
   });
   const [logs, setLogs] = useState([]);
-  const [isConnected, setIsConnected] = useState(false);
+  const [isConnected, setIsConnected] = useState(true);
   const [selectedPerson, setSelectedPerson] = useState(null);
   const [customReason, setCustomReason] = useState('');
   const [isPlayingMusic, setIsPlayingMusic] = useState(false);
@@ -81,13 +81,15 @@ function App() {
   const audioRef = useRef(null);
   const musicTimerRef = useRef(null);
   const channelRef = useRef(null);
+  const currentShaRef = useRef(null);
+  const isUpdatingRef = useRef(false);
 
   // Save avatars to localStorage
   useEffect(() => {
     localStorage.setItem('scam_avatars', JSON.stringify(avatars));
   }, [avatars]);
 
-  // Real-time broadcast channel for instant multi-tab sync
+  // Real-time BroadcastChannel for instant local tab sync
   useEffect(() => {
     try {
       const channel = new BroadcastChannel('scam_counter_channel');
@@ -105,71 +107,50 @@ function App() {
     };
   }, []);
 
-  // Load / Sync real-time state from Firebase DB & SSE (Local server fallback)
+  // Poll cloud data every 2.5s to get live updates from friends on other devices
   useEffect(() => {
-    let unsubscribeFirebase = null;
-    
-    // 1. Firebase Realtime Database Listener
-    if (db) {
-      try {
-        const scamRef = ref(db, 'scamData');
-        unsubscribeFirebase = onValue(scamRef, (snapshot) => {
-          const data = snapshot.val();
-          if (data) {
-            if (data.counts) setCounts(data.counts);
-            if (data.logs) setLogs(data.logs);
-            setIsConnected(true);
-          } else {
-            setIsConnected(true);
-          }
-        }, (err) => {
-          console.warn("Firebase sync error, falling back", err);
-          setIsConnected(false);
-        });
-      } catch (e) {
-        console.warn("Firebase listener setup error", e);
-      }
-    }
+    let isMounted = true;
 
-    // 2. Fallback SSE for local Vite server if running locally
-    let eventSource;
-    if (import.meta.env.DEV) {
-      try {
-        eventSource = new EventSource('/api/events');
-        eventSource.onopen = () => setIsConnected(true);
-        eventSource.onmessage = (event) => {
-          try {
-            const payload = JSON.parse(event.data);
-            if (payload.type === 'INIT') {
-              setCounts(payload.data.counts);
-              setLogs(payload.data.logs || []);
-            } else if (payload.type === 'UPDATE') {
-              setCounts(payload.data.counts);
-              if (payload.newLog) {
-                setLogs(prev => [payload.newLog, ...prev.slice(0, 49)]);
-              }
-              playPopSound('up');
-            }
-          } catch (err) {}
-        };
-      } catch (e) {}
-    } else if (!db) {
-      // LocalStorage fallback for static hosting if no DB
-      const localCounts = localStorage.getItem('scam_counts');
-      const localLogs = localStorage.getItem('scam_logs');
-      if (localCounts) try { setCounts(JSON.parse(localCounts)); } catch (e) {}
-      if (localLogs) try { setLogs(JSON.parse(localLogs)); } catch (e) {}
-      setIsConnected(true);
-    }
+    const syncWithCloud = async () => {
+      if (isUpdatingRef.current) return;
+      const res = await fetchLiveData();
+      if (res && res.data && isMounted) {
+        setIsConnected(true);
+        if (res.sha) currentShaRef.current = res.sha;
+        
+        const cloudCounts = res.data.counts || {};
+        const cloudLogs = res.data.logs || [];
+
+        setCounts(prev => {
+          if (JSON.stringify(prev) !== JSON.stringify(cloudCounts)) {
+            return cloudCounts;
+          }
+          return prev;
+        });
+
+        setLogs(prev => {
+          if (JSON.stringify(prev) !== JSON.stringify(cloudLogs)) {
+            return cloudLogs;
+          }
+          return prev;
+        });
+      }
+    };
+
+    // Initial fetch
+    syncWithCloud();
+
+    // Live polling interval (every 2.5 seconds)
+    const interval = setInterval(syncWithCloud, 2500);
 
     return () => {
-      if (unsubscribeFirebase) unsubscribeFirebase();
-      if (eventSource) eventSource.close();
+      isMounted = false;
+      clearInterval(interval);
     };
   }, []);
 
-  // Sync state to Firebase / BroadcastChannel / LocalStorage
-  const updateGlobalState = (newCounts, newLogs) => {
+  // Save state to Cloud + LocalStorage + BroadcastChannel
+  const saveState = async (newCounts, newLogs) => {
     setCounts(newCounts);
     setLogs(newLogs);
 
@@ -186,13 +167,15 @@ function App() {
       } catch (e) {}
     }
 
-    // Sync to Firebase DB
-    if (db) {
-      try {
-        set(ref(db, 'scamData'), { counts: newCounts, logs: newLogs });
-      } catch (e) {
-        console.warn("Failed to write to Firebase", e);
-      }
+    // Push to GitHub Cloud DB
+    isUpdatingRef.current = true;
+    try {
+      const newSha = await pushLiveData({ counts: newCounts, logs: newLogs }, currentShaRef.current);
+      if (newSha) currentShaRef.current = newSha;
+    } finally {
+      setTimeout(() => {
+        isUpdatingRef.current = false;
+      }, 1000);
     }
   };
 
@@ -218,7 +201,7 @@ function App() {
         audio.pause();
         audio.currentTime = 0;
         setIsPlayingMusic(false);
-      }, 10000); // 10 Seconds
+      }, 10000);
     }).catch(err => {
       console.log('Autoplay waiting for user interaction');
     });
@@ -302,11 +285,10 @@ function App() {
     render();
   };
 
-  const handleIncrement = async (name, reason = 'Ngebual / Ngibulin temen', e = null) => {
+  const handleIncrement = (name, reason = 'Ngebual / Ngibulin temen', e = null) => {
     if (e) triggerConfetti(e);
     playPopSound('up');
 
-    // Unlock browser audio context if needed
     if (audioRef.current && !isPlayingMusic && !isMuted && topScammer) {
       play10SecSong();
     }
@@ -321,21 +303,10 @@ function App() {
     };
     const newLogs = [newLog, ...logs.slice(0, 49)];
 
-    updateGlobalState(newCounts, newLogs);
-
-    // Call local dev API if running in dev mode
-    if (import.meta.env.DEV) {
-      try {
-        await fetch('/api/scam', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ type: 'INCREMENT', name, reason, by: 'Tongkrongan' })
-        });
-      } catch (err) {}
-    }
+    saveState(newCounts, newLogs);
   };
 
-  const handleDecrement = async (name, e = null) => {
+  const handleDecrement = (name, e = null) => {
     playPopSound('down');
     const newCounts = { ...counts, [name]: Math.max(0, (counts[name] || 0) - 1) };
     const newLog = {
@@ -347,20 +318,10 @@ function App() {
     };
     const newLogs = [newLog, ...logs.slice(0, 49)];
 
-    updateGlobalState(newCounts, newLogs);
-
-    if (import.meta.env.DEV) {
-      try {
-        await fetch('/api/scam', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ type: 'DECREMENT', name, by: 'Tongkrongan' })
-        });
-      } catch (err) {}
-    }
+    saveState(newCounts, newLogs);
   };
 
-  const handleResetPerson = async (name) => {
+  const handleResetPerson = (name) => {
     if (!window.confirm(`Reset jumlah scam ${name} kembali ke 0?`)) return;
     playPopSound('down');
     const newCounts = { ...counts, [name]: 0 };
@@ -373,35 +334,15 @@ function App() {
     };
     const newLogs = [newLog, ...logs.slice(0, 49)];
 
-    updateGlobalState(newCounts, newLogs);
-
-    if (import.meta.env.DEV) {
-      try {
-        await fetch('/api/scam', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ type: 'RESET_PERSON', name })
-        });
-      } catch (e) {}
-    }
+    saveState(newCounts, newLogs);
   };
 
-  const handleResetAll = async () => {
+  const handleResetAll = () => {
     if (!window.confirm('Yakin mau reset SEMUA hitungan scam hari ini?')) return;
     const newCounts = { Rifqi: 0, Ilham: 0, Jonathan: 0, Fatwa: 0, Agung: 0, Dini: 0 };
     const newLogs = [];
 
-    updateGlobalState(newCounts, newLogs);
-
-    if (import.meta.env.DEV) {
-      try {
-        await fetch('/api/scam', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ type: 'RESET' })
-        });
-      } catch (e) {}
-    }
+    saveState(newCounts, newLogs);
   };
 
   const handleRandomizeEmoji = (name) => {
@@ -441,7 +382,7 @@ function App() {
         <div className="status-bar">
           <div className="status-indicator">
             <span className="pulse-dot"></span>
-            {isConnected ? 'Real-time Live Sync (Terhubung)' : 'Mode Lokal / Offline'}
+            {isConnected ? 'Live Cloud Sync (Terhubung Realtime)' : 'Menghubungkan...'}
           </div>
 
           <button 

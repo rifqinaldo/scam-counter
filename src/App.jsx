@@ -8,6 +8,8 @@ const EMOJI_POOL = [
   '🐸', '🥸', '🥷', '💩', '🤪', '🗿'
 ];
 
+const COLOR_CLASSES = ['rifqi', 'ilham', 'jonathan', 'fatwa', 'agung', 'dini'];
+
 const INITIAL_PEOPLE = [
   { name: 'Rifqi', title: 'The OTW Phantom', defaultAvatar: '🦊', colorClass: 'rifqi' },
   { name: 'Ilham', title: 'Suhu Wacana', defaultAvatar: '👺', colorClass: 'ilham' },
@@ -58,13 +60,22 @@ function playPopSound(type = 'up') {
 }
 
 function App() {
+  // Dynamic people list state
+  const [people, setPeople] = useState(() => {
+    const saved = localStorage.getItem('scam_people_v3');
+    if (saved) {
+      try { return JSON.parse(saved); } catch (e) {}
+    }
+    return INITIAL_PEOPLE;
+  });
+
   // Load initial counts from localStorage so refresh NEVER resets to 0
   const [counts, setCounts] = useState(() => {
     const saved = localStorage.getItem('scam_counts_v2');
     if (saved) {
       try { return JSON.parse(saved); } catch (e) {}
     }
-    return { Rifqi: 0, Ilham: 0, Jonathan: 0, Fatwa: 0, Agung: 0, Dini: 0 };
+    return INITIAL_PEOPLE.reduce((acc, p) => ({ ...acc, [p.name]: 0 }), {});
   });
 
   const [logs, setLogs] = useState(() => {
@@ -80,6 +91,12 @@ function App() {
   const [customReason, setCustomReason] = useState('');
   const [isPlayingMusic, setIsPlayingMusic] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
+
+  // Modal for adding a new member
+  const [isAddMemberOpen, setIsAddMemberOpen] = useState(false);
+  const [newMemberName, setNewMemberName] = useState('');
+  const [newMemberTitle, setNewMemberTitle] = useState('');
+  const [newMemberAvatar, setNewMemberAvatar] = useState('😎');
   
   // Custom emojis state per person
   const [avatars, setAvatars] = useState(() => {
@@ -112,9 +129,10 @@ function App() {
       channelRef.current = channel;
       channel.onmessage = (event) => {
         if (event.data?.type === 'SYNC') {
+          if (event.data.people) setPeople(event.data.people);
           if (event.data.counts) setCounts(event.data.counts);
           if (event.data.logs) setLogs(event.data.logs);
-          // Also sync our timestamp so we don't overwrite with stale cloud data
+          if (event.data.avatars) setAvatars(event.data.avatars);
           if (event.data.updatedAt) {
             localUpdatedAtRef.current = event.data.updatedAt;
             lastUserActionRef.current = event.data.updatedAt;
@@ -140,21 +158,31 @@ function App() {
       if (res.sha) currentShaRef.current = res.sha;
 
       const cloudUpdatedAt = res.data.updatedAt || 0;
+      const cloudPeople = res.data.people || null;
       const cloudCounts = res.data.counts || {};
       const cloudLogs = res.data.logs || [];
+      const cloudAvatars = res.data.avatars || null;
 
       // If user acted recently AND our local data is newer, skip overwrite
       const timeSinceLastAction = Date.now() - lastUserActionRef.current;
       const localIsNewer = localUpdatedAtRef.current >= cloudUpdatedAt;
 
       if (timeSinceLastAction < 8000 && localIsNewer) {
-        // Our local state is more recent — don't overwrite
         return;
       }
 
       // Cloud is newer — accept cloud state
       if (cloudUpdatedAt > localUpdatedAtRef.current) {
         localUpdatedAtRef.current = cloudUpdatedAt;
+
+        if (cloudPeople && Array.isArray(cloudPeople)) {
+          setPeople(cloudPeople);
+          try { localStorage.setItem('scam_people_v3', JSON.stringify(cloudPeople)); } catch (e) {}
+        }
+        if (cloudAvatars) {
+          setAvatars(cloudAvatars);
+          try { localStorage.setItem('scam_avatars', JSON.stringify(cloudAvatars)); } catch (e) {}
+        }
 
         setCounts(cloudCounts);
         setLogs(cloudLogs);
@@ -179,18 +207,22 @@ function App() {
   }, []);
 
   // Save state to Cloud + LocalStorage + BroadcastChannel
-  const saveState = async (newCounts, newLogs) => {
+  const saveState = async (newCounts, newLogs, newPeople = people, newAvatars = avatars) => {
     const now = Date.now();
     lastUserActionRef.current = now;
     localUpdatedAtRef.current = now;
 
     setCounts(newCounts);
     setLogs(newLogs);
+    setPeople(newPeople);
+    setAvatars(newAvatars);
 
     // Save to LocalStorage immediately
     try {
+      localStorage.setItem('scam_people_v3', JSON.stringify(newPeople));
       localStorage.setItem('scam_counts_v2', JSON.stringify(newCounts));
       localStorage.setItem('scam_logs_v2', JSON.stringify(newLogs));
+      localStorage.setItem('scam_avatars', JSON.stringify(newAvatars));
     } catch (e) {}
 
     // Broadcast across local browser tabs (instant)
@@ -198,29 +230,105 @@ function App() {
       try {
         channelRef.current.postMessage({
           type: 'SYNC',
+          people: newPeople,
           counts: newCounts,
           logs: newLogs,
+          avatars: newAvatars,
           updatedAt: now
         });
       } catch (e) {}
     }
 
-    // Push to GitHub Cloud (auto-resolves SHA conflicts internally)
+    // Push to GitHub Cloud
     try {
-      const newSha = await pushLiveData(
-        { counts: newCounts, logs: newLogs },
-        currentShaRef.current
-      );
+      const payload = {
+        people: newPeople,
+        counts: newCounts,
+        logs: newLogs,
+        avatars: newAvatars
+      };
+      const newSha = await pushLiveData(payload, currentShaRef.current);
       if (newSha) {
         currentShaRef.current = newSha;
-        // Update our local timestamp to match what was just pushed
         localUpdatedAtRef.current = now;
       }
     } catch (e) {}
   };
 
+  // Handler to Add a New Member
+  const handleAddMember = (e) => {
+    e.preventDefault();
+    const trimmedName = newMemberName.trim();
+    if (!trimmedName) {
+      alert('Nama member tidak boleh kosong!');
+      return;
+    }
+
+    // Check duplicate
+    if (people.some(p => p.name.toLowerCase() === trimmedName.toLowerCase())) {
+      alert(`Member dengan nama "${trimmedName}" sudah ada!`);
+      return;
+    }
+
+    const title = newMemberTitle.trim() || 'Tukang Wacana';
+    const colorClass = COLOR_CLASSES[people.length % COLOR_CLASSES.length];
+    const avatar = newMemberAvatar || '😎';
+
+    const newPerson = {
+      name: trimmedName,
+      title: title,
+      defaultAvatar: avatar,
+      colorClass: colorClass
+    };
+
+    const newPeopleList = [...people, newPerson];
+    const newCounts = { ...counts, [trimmedName]: 0 };
+    const newAvatars = { ...avatars, [trimmedName]: avatar };
+    
+    const newLog = {
+      id: Date.now(),
+      name: trimmedName,
+      reason: `Member baru "${trimmedName}" bergabung ke tongkrongan 🎉`,
+      by: 'System',
+      timestamp: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    };
+    const newLogs = [newLog, ...logs.slice(0, 49)];
+
+    saveState(newCounts, newLogs, newPeopleList, newAvatars);
+
+    playPopSound('up');
+    setNewMemberName('');
+    setNewMemberTitle('');
+    setNewMemberAvatar('😎');
+    setIsAddMemberOpen(false);
+  };
+
+  // Handler to Remove a Member
+  const handleRemoveMember = (name) => {
+    if (!window.confirm(`Yakin mau menghapus ${name} dari daftar member?`)) return;
+
+    const newPeopleList = people.filter(p => p.name !== name);
+    const newCounts = { ...counts };
+    delete newCounts[name];
+
+    const newAvatars = { ...avatars };
+    delete newAvatars[name];
+
+    const newLog = {
+      id: Date.now(),
+      name,
+      reason: `Member "${name}" telah dihapus dari tongkrongan 🚪`,
+      by: 'System',
+      timestamp: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    };
+    const newLogs = [newLog, ...logs.slice(0, 49)];
+
+    saveState(newCounts, newLogs, newPeopleList, newAvatars);
+    playPopSound('down');
+  };
+
   // Find Top Scammer (King)
-  const maxCount = Math.max(...Object.values(counts));
+  const maxCount = Math.max(...Object.values(counts), 0);
   const topScammer = maxCount > 0 ? Object.keys(counts).find(name => counts[name] === maxCount) : null;
   const totalScams = Object.values(counts).reduce((a, b) => a + b, 0);
 
@@ -379,20 +487,22 @@ function App() {
 
   const handleResetAll = () => {
     if (!window.confirm('Yakin mau reset SEMUA hitungan scam hari ini?')) return;
-    const newCounts = { Rifqi: 0, Ilham: 0, Jonathan: 0, Fatwa: 0, Agung: 0, Dini: 0 };
+    const newCounts = people.reduce((acc, p) => ({ ...acc, [p.name]: 0 }), {});
     const newLogs = [];
 
     saveState(newCounts, newLogs);
   };
 
   const handleRandomizeEmoji = (name) => {
-    const current = avatars[name];
+    const current = avatars[name] || '😎';
     let nextEmoji;
     do {
       nextEmoji = EMOJI_POOL[Math.floor(Math.random() * EMOJI_POOL.length)];
     } while (nextEmoji === current && EMOJI_POOL.length > 1);
 
-    setAvatars(prev => ({ ...prev, [name]: nextEmoji }));
+    const newAvatars = { ...avatars, [name]: nextEmoji };
+    setAvatars(newAvatars);
+    saveState(counts, logs, people, newAvatars);
     playPopSound('up');
   };
 
@@ -416,7 +526,7 @@ function App() {
         <div className="title-badge">🚨 Official Tongkrongan Tracker</div>
         <h1 className="app-title">SCAM COUNTER HARI INI</h1>
         <p className="app-subtitle">
-          Pencatat ngibulin temen real-time! Tambah/kurangi hitungan scam, acak emoji avatar, & tandingkan siapa Raja Scammer hari ini!
+          Pencatat ngibulin temen real-time! Tambah member baru, tambah/kurangi hitungan scam, & tandingkan siapa Raja Scammer hari ini!
         </p>
 
         <div className="status-bar">
@@ -424,6 +534,20 @@ function App() {
             <span className="pulse-dot"></span>
             {isConnected ? 'Live Cloud Sync (Terhubung Realtime)' : 'Menghubungkan...'}
           </div>
+
+          <button 
+            onClick={() => setIsAddMemberOpen(true)}
+            className="btn-reason"
+            style={{ 
+              width: 'auto', 
+              background: 'rgba(59, 130, 246, 0.2)',
+              borderColor: '#3B82F6',
+              color: '#60A5FA',
+              fontWeight: '700'
+            }}
+          >
+            ➕ Tambah Member Baru
+          </button>
 
           <button 
             onClick={toggleMusic} 
@@ -448,6 +572,10 @@ function App() {
         <div className="stat-item">
           <span className="stat-label">Total Scam Hari Ini</span>
           <span className="stat-value">{totalScams} 🔥</span>
+        </div>
+        <div className="stat-item">
+          <span className="stat-label">Total Member</span>
+          <span className="stat-value">{people.length} 👥</span>
         </div>
         <div className="stat-item">
           <span className="stat-label">Raja Scammer (Top 1)</span>
@@ -494,16 +622,42 @@ function App() {
 
       {/* Cards Grid */}
       <div className="cards-grid">
-        {INITIAL_PEOPLE.map(person => {
+        {people.map(person => {
           const count = counts[person.name] || 0;
           const isKing = topScammer === person.name;
-          const currentEmoji = avatars[person.name] || person.defaultAvatar;
+          const currentEmoji = avatars[person.name] || person.defaultAvatar || '😎';
 
           return (
             <div 
               key={person.name} 
-              className={`person-card ${person.colorClass} ${isKing ? 'king-scammer' : ''}`}
+              className={`person-card ${person.colorClass || 'rifqi'} ${isKing ? 'king-scammer' : ''}`}
+              style={{ position: 'relative' }}
             >
+              {/* Delete Member Button */}
+              <button 
+                onClick={() => handleRemoveMember(person.name)}
+                title="Hapus member ini"
+                style={{
+                  position: 'absolute',
+                  top: '12px',
+                  right: '12px',
+                  background: 'rgba(239, 68, 68, 0.15)',
+                  border: '1px solid rgba(239, 68, 68, 0.3)',
+                  color: '#EF4444',
+                  borderRadius: '50%',
+                  width: '26px',
+                  height: '26px',
+                  cursor: 'pointer',
+                  fontSize: '0.75rem',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  zIndex: 2
+                }}
+              >
+                ✕
+              </button>
+
               {isKing && <div className="king-banner">👑 KING OF SCAM</div>}
               
               <div 
@@ -592,6 +746,81 @@ function App() {
           )}
         </div>
       </section>
+
+      {/* Modal Add New Member */}
+      {isAddMemberOpen && (
+        <div className="modal-overlay" onClick={() => setIsAddMemberOpen(false)}>
+          <div className="modal-content" onClick={e => e.stopPropagation()}>
+            <h3 className="modal-header">
+              ➕ Tambah Member Tongkrongan Baru
+            </h3>
+            
+            <form onSubmit={handleAddMember}>
+              <div style={{ marginBottom: '14px' }}>
+                <label style={{ display: 'block', fontSize: '0.85rem', color: '#9CA3AF', marginBottom: '6px' }}>
+                  Nama Member:
+                </label>
+                <input 
+                  type="text" 
+                  className="custom-input"
+                  placeholder="Contoh: Budi, Agus, dll..."
+                  value={newMemberName}
+                  onChange={e => setNewMemberName(e.target.value)}
+                  autoFocus
+                />
+              </div>
+
+              <div style={{ marginBottom: '14px' }}>
+                <label style={{ display: 'block', fontSize: '0.85rem', color: '#9CA3AF', marginBottom: '6px' }}>
+                  Gelar / Julukan (Opsional):
+                </label>
+                <input 
+                  type="text" 
+                  className="custom-input"
+                  placeholder="Contoh: Si Tukang Janji, Master Wacana..."
+                  value={newMemberTitle}
+                  onChange={e => setNewMemberTitle(e.target.value)}
+                />
+              </div>
+
+              <div style={{ marginBottom: '18px' }}>
+                <label style={{ display: 'block', fontSize: '0.85rem', color: '#9CA3AF', marginBottom: '6px' }}>
+                  Pilih Emoji Avatar:
+                </label>
+                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', maxHeight: '110px', overflowY: 'auto', padding: '4px' }}>
+                  {EMOJI_POOL.map((emoji) => (
+                    <button
+                      type="button"
+                      key={emoji}
+                      onClick={() => setNewMemberAvatar(emoji)}
+                      style={{
+                        background: newMemberAvatar === emoji ? 'rgba(59, 130, 246, 0.3)' : 'rgba(255, 255, 255, 0.05)',
+                        border: newMemberAvatar === emoji ? '2px solid #3B82F6' : '1px solid rgba(255, 255, 255, 0.1)',
+                        borderRadius: '10px',
+                        fontSize: '1.4rem',
+                        padding: '6px 10px',
+                        cursor: 'pointer',
+                        transition: 'transform 0.15s'
+                      }}
+                    >
+                      {emoji}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="modal-actions">
+                <button type="button" className="btn-cancel" onClick={() => setIsAddMemberOpen(false)}>
+                  Batal
+                </button>
+                <button type="submit" className="btn-submit">
+                  Simpan Member 🚀
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {/* Modal for adding custom / preset reason */}
       {selectedPerson && (

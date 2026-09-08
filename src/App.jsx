@@ -95,7 +95,10 @@ function App() {
   const musicTimerRef = useRef(null);
   const channelRef = useRef(null);
   const currentShaRef = useRef(null);
+  // Timestamp of the last local user action (ms since epoch)
   const lastUserActionRef = useRef(0);
+  // Timestamp of the data currently shown (from cloud or local)
+  const localUpdatedAtRef = useRef(0);
 
   // Save avatars to localStorage
   useEffect(() => {
@@ -111,6 +114,11 @@ function App() {
         if (event.data?.type === 'SYNC') {
           if (event.data.counts) setCounts(event.data.counts);
           if (event.data.logs) setLogs(event.data.logs);
+          // Also sync our timestamp so we don't overwrite with stale cloud data
+          if (event.data.updatedAt) {
+            localUpdatedAtRef.current = event.data.updatedAt;
+            lastUserActionRef.current = event.data.updatedAt;
+          }
           playPopSound('up');
         }
       };
@@ -120,53 +128,48 @@ function App() {
     };
   }, []);
 
-  // Poll cloud data every 3s and merge intelligently (never overwrite local higher counts)
+  // Poll cloud data every 3s — use timestamp to determine who wins conflict
   useEffect(() => {
     let isMounted = true;
 
     const syncWithCloud = async () => {
-      // Don't overwrite if user just clicked within 6 seconds
-      if (Date.now() - lastUserActionRef.current < 6000) return;
-
       const res = await fetchLiveData();
-      if (res && res.data && isMounted) {
-        setIsConnected(true);
-        if (res.sha) currentShaRef.current = res.sha;
-        
-        const cloudCounts = res.data.counts || {};
-        const cloudLogs = res.data.logs || [];
+      if (!res || !res.data || !isMounted) return;
 
-        setCounts(prev => {
-          const merged = { ...prev };
-          let changed = false;
-          Object.keys(cloudCounts).forEach(person => {
-            if ((cloudCounts[person] || 0) > (merged[person] || 0)) {
-              merged[person] = cloudCounts[person];
-              changed = true;
-            }
-          });
+      setIsConnected(true);
+      if (res.sha) currentShaRef.current = res.sha;
 
-          if (changed) {
-            try { localStorage.setItem('scam_counts_v2', JSON.stringify(merged)); } catch (e) {}
-            return merged;
-          }
-          return prev;
-        });
+      const cloudUpdatedAt = res.data.updatedAt || 0;
+      const cloudCounts = res.data.counts || {};
+      const cloudLogs = res.data.logs || [];
 
-        setLogs(prev => {
-          if (cloudLogs.length > prev.length) {
-            try { localStorage.setItem('scam_logs_v2', JSON.stringify(cloudLogs)); } catch (e) {}
-            return cloudLogs;
-          }
-          return prev;
-        });
+      // If user acted recently AND our local data is newer, skip overwrite
+      const timeSinceLastAction = Date.now() - lastUserActionRef.current;
+      const localIsNewer = localUpdatedAtRef.current >= cloudUpdatedAt;
+
+      if (timeSinceLastAction < 8000 && localIsNewer) {
+        // Our local state is more recent — don't overwrite
+        return;
+      }
+
+      // Cloud is newer — accept cloud state
+      if (cloudUpdatedAt > localUpdatedAtRef.current) {
+        localUpdatedAtRef.current = cloudUpdatedAt;
+
+        setCounts(cloudCounts);
+        setLogs(cloudLogs);
+
+        try {
+          localStorage.setItem('scam_counts_v2', JSON.stringify(cloudCounts));
+          localStorage.setItem('scam_logs_v2', JSON.stringify(cloudLogs));
+        } catch (e) {}
       }
     };
 
     // Initial fetch
     syncWithCloud();
 
-    // Live polling interval (every 3 seconds)
+    // Live polling every 3 seconds
     const interval = setInterval(syncWithCloud, 3000);
 
     return () => {
@@ -176,8 +179,11 @@ function App() {
   }, []);
 
   // Save state to Cloud + LocalStorage + BroadcastChannel
-  const saveState = async (newCounts, newLogs, forceShaReset = false) => {
-    lastUserActionRef.current = Date.now();
+  const saveState = async (newCounts, newLogs) => {
+    const now = Date.now();
+    lastUserActionRef.current = now;
+    localUpdatedAtRef.current = now;
+
     setCounts(newCounts);
     setLogs(newLogs);
 
@@ -187,18 +193,29 @@ function App() {
       localStorage.setItem('scam_logs_v2', JSON.stringify(newLogs));
     } catch (e) {}
 
-    // Broadcast across local browser tabs
+    // Broadcast across local browser tabs (instant)
     if (channelRef.current) {
       try {
-        channelRef.current.postMessage({ type: 'SYNC', counts: newCounts, logs: newLogs });
+        channelRef.current.postMessage({
+          type: 'SYNC',
+          counts: newCounts,
+          logs: newLogs,
+          updatedAt: now
+        });
       } catch (e) {}
     }
 
-    // Push to GitHub Cloud DB asynchronously
+    // Push to GitHub Cloud (auto-resolves SHA conflicts internally)
     try {
-      const shaToUse = forceShaReset ? null : currentShaRef.current;
-      const newSha = await pushLiveData({ counts: newCounts, logs: newLogs }, shaToUse);
-      if (newSha) currentShaRef.current = newSha;
+      const newSha = await pushLiveData(
+        { counts: newCounts, logs: newLogs },
+        currentShaRef.current
+      );
+      if (newSha) {
+        currentShaRef.current = newSha;
+        // Update our local timestamp to match what was just pushed
+        localUpdatedAtRef.current = now;
+      }
     } catch (e) {}
   };
 
@@ -341,7 +358,7 @@ function App() {
     };
     const newLogs = [newLog, ...logs.slice(0, 49)];
 
-    saveState(newCounts, newLogs, true);
+    saveState(newCounts, newLogs);
   };
 
   const handleResetPerson = (name) => {
@@ -357,7 +374,7 @@ function App() {
     };
     const newLogs = [newLog, ...logs.slice(0, 49)];
 
-    saveState(newCounts, newLogs, true);
+    saveState(newCounts, newLogs);
   };
 
   const handleResetAll = () => {
@@ -365,7 +382,7 @@ function App() {
     const newCounts = { Rifqi: 0, Ilham: 0, Jonathan: 0, Fatwa: 0, Agung: 0, Dini: 0 };
     const newLogs = [];
 
-    saveState(newCounts, newLogs, true);
+    saveState(newCounts, newLogs);
   };
 
   const handleRandomizeEmoji = (name) => {

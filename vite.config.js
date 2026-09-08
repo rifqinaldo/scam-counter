@@ -140,6 +140,7 @@ function scamSyncPlugin() {
 
 // https://vite.dev/config/
 export default defineConfig({
+  base: '/scam-counter/',
   plugins: [react(), scamSyncPlugin()],
   server: {
     allowedHosts: true

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import './index.css';
+import { db, ref, onValue, set } from './firebase';
 
 const EMOJI_POOL = [
   '🦊', '👺', '😈', '🤡', '🦁', '🐼', '🤖', '🐙', 
@@ -79,56 +80,129 @@ function App() {
   const canvasRef = useRef(null);
   const audioRef = useRef(null);
   const musicTimerRef = useRef(null);
+  const channelRef = useRef(null);
 
   // Save avatars to localStorage
   useEffect(() => {
     localStorage.setItem('scam_avatars', JSON.stringify(avatars));
   }, [avatars]);
 
-  // Load / Sync real-time state from SSE
+  // Real-time broadcast channel for instant multi-tab sync
   useEffect(() => {
-    let eventSource;
     try {
-      eventSource = new EventSource('/api/events');
-      
-      eventSource.onopen = () => {
-        setIsConnected(true);
-      };
-
-      eventSource.onmessage = (event) => {
-        try {
-          const payload = JSON.parse(event.data);
-          if (payload.type === 'INIT') {
-            setCounts(payload.data.counts);
-            setLogs(payload.data.logs || []);
-          } else if (payload.type === 'UPDATE') {
-            setCounts(payload.data.counts);
-            if (payload.newLog) {
-              setLogs(prev => [payload.newLog, ...prev.slice(0, 49)]);
-            }
-            playPopSound('up');
-          }
-        } catch (err) {
-          console.error('SSE JSON error', err);
+      const channel = new BroadcastChannel('scam_counter_channel');
+      channelRef.current = channel;
+      channel.onmessage = (event) => {
+        if (event.data?.type === 'SYNC') {
+          if (event.data.counts) setCounts(event.data.counts);
+          if (event.data.logs) setLogs(event.data.logs);
+          playPopSound('up');
         }
       };
+    } catch (e) {}
+    return () => {
+      if (channelRef.current) channelRef.current.close();
+    };
+  }, []);
 
-      eventSource.onerror = () => {
-        setIsConnected(false);
-      };
-    } catch (e) {
-      setIsConnected(false);
+  // Load / Sync real-time state from Firebase DB & SSE (Local server fallback)
+  useEffect(() => {
+    let unsubscribeFirebase = null;
+    
+    // 1. Firebase Realtime Database Listener
+    if (db) {
+      try {
+        const scamRef = ref(db, 'scamData');
+        unsubscribeFirebase = onValue(scamRef, (snapshot) => {
+          const data = snapshot.val();
+          if (data) {
+            if (data.counts) setCounts(data.counts);
+            if (data.logs) setLogs(data.logs);
+            setIsConnected(true);
+          } else {
+            setIsConnected(true);
+          }
+        }, (err) => {
+          console.warn("Firebase sync error, falling back", err);
+          setIsConnected(false);
+        });
+      } catch (e) {
+        console.warn("Firebase listener setup error", e);
+      }
+    }
+
+    // 2. Fallback SSE for local Vite server if running locally
+    let eventSource;
+    if (import.meta.env.DEV) {
+      try {
+        eventSource = new EventSource('/api/events');
+        eventSource.onopen = () => setIsConnected(true);
+        eventSource.onmessage = (event) => {
+          try {
+            const payload = JSON.parse(event.data);
+            if (payload.type === 'INIT') {
+              setCounts(payload.data.counts);
+              setLogs(payload.data.logs || []);
+            } else if (payload.type === 'UPDATE') {
+              setCounts(payload.data.counts);
+              if (payload.newLog) {
+                setLogs(prev => [payload.newLog, ...prev.slice(0, 49)]);
+              }
+              playPopSound('up');
+            }
+          } catch (err) {}
+        };
+      } catch (e) {}
+    } else if (!db) {
+      // LocalStorage fallback for static hosting if no DB
+      const localCounts = localStorage.getItem('scam_counts');
+      const localLogs = localStorage.getItem('scam_logs');
+      if (localCounts) try { setCounts(JSON.parse(localCounts)); } catch (e) {}
+      if (localLogs) try { setLogs(JSON.parse(localLogs)); } catch (e) {}
+      setIsConnected(true);
     }
 
     return () => {
+      if (unsubscribeFirebase) unsubscribeFirebase();
       if (eventSource) eventSource.close();
     };
   }, []);
+
+  // Sync state to Firebase / BroadcastChannel / LocalStorage
+  const updateGlobalState = (newCounts, newLogs) => {
+    setCounts(newCounts);
+    setLogs(newLogs);
+
+    // Save to LocalStorage
+    try {
+      localStorage.setItem('scam_counts', JSON.stringify(newCounts));
+      localStorage.setItem('scam_logs', JSON.stringify(newLogs));
+    } catch (e) {}
+
+    // Broadcast across browser tabs
+    if (channelRef.current) {
+      try {
+        channelRef.current.postMessage({ type: 'SYNC', counts: newCounts, logs: newLogs });
+      } catch (e) {}
+    }
+
+    // Sync to Firebase DB
+    if (db) {
+      try {
+        set(ref(db, 'scamData'), { counts: newCounts, logs: newLogs });
+      } catch (e) {
+        console.warn("Failed to write to Firebase", e);
+      }
+    }
+  };
 
   // Find Top Scammer (King)
   const maxCount = Math.max(...Object.values(counts));
   const topScammer = maxCount > 0 ? Object.keys(counts).find(name => counts[name] === maxCount) : null;
   const totalScams = Object.values(counts).reduce((a, b) => a + b, 0);
+
+  // Audio path for DJ Mahjong song
+  const audioSrc = `${import.meta.env.BASE_URL}king-song.mp3`;
 
   // Play DJ Mahjong song for EXACTLY 10 seconds when someone becomes King
   const play10SecSong = () => {
@@ -237,61 +311,96 @@ function App() {
       play10SecSong();
     }
 
-    setCounts(prev => ({ ...prev, [name]: (prev[name] || 0) + 1 }));
+    const newCounts = { ...counts, [name]: (counts[name] || 0) + 1 };
+    const newLog = {
+      id: Date.now(),
+      name,
+      reason,
+      by: 'Tongkrongan',
+      timestamp: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    };
+    const newLogs = [newLog, ...logs.slice(0, 49)];
 
-    try {
-      await fetch('/api/scam', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'INCREMENT', name, reason, by: 'Tongkrongan' })
-      });
-    } catch (err) {
-      console.error('Failed to increment', err);
+    updateGlobalState(newCounts, newLogs);
+
+    // Call local dev API if running in dev mode
+    if (import.meta.env.DEV) {
+      try {
+        await fetch('/api/scam', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type: 'INCREMENT', name, reason, by: 'Tongkrongan' })
+        });
+      } catch (err) {}
     }
   };
 
   const handleDecrement = async (name, e = null) => {
     playPopSound('down');
-    setCounts(prev => ({ ...prev, [name]: Math.max(0, (prev[name] || 0) - 1) }));
+    const newCounts = { ...counts, [name]: Math.max(0, (counts[name] || 0) - 1) };
+    const newLog = {
+      id: Date.now(),
+      name,
+      reason: 'Dikurangi 1 scam (Salah pencet / Ampunan)',
+      by: 'Tongkrongan',
+      timestamp: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    };
+    const newLogs = [newLog, ...logs.slice(0, 49)];
 
-    try {
-      await fetch('/api/scam', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'DECREMENT', name, by: 'Tongkrongan' })
-      });
-    } catch (err) {
-      console.error('Failed to decrement', err);
+    updateGlobalState(newCounts, newLogs);
+
+    if (import.meta.env.DEV) {
+      try {
+        await fetch('/api/scam', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type: 'DECREMENT', name, by: 'Tongkrongan' })
+        });
+      } catch (err) {}
     }
   };
 
   const handleResetPerson = async (name) => {
     if (!window.confirm(`Reset jumlah scam ${name} kembali ke 0?`)) return;
     playPopSound('down');
-    setCounts(prev => ({ ...prev, [name]: 0 }));
+    const newCounts = { ...counts, [name]: 0 };
+    const newLog = {
+      id: Date.now(),
+      name,
+      reason: `Hitungan scam ${name} di-reset ke 0`,
+      by: 'System',
+      timestamp: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    };
+    const newLogs = [newLog, ...logs.slice(0, 49)];
 
-    try {
-      await fetch('/api/scam', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'RESET_PERSON', name })
-      });
-    } catch (e) {
-      console.error('Failed to reset person', e);
+    updateGlobalState(newCounts, newLogs);
+
+    if (import.meta.env.DEV) {
+      try {
+        await fetch('/api/scam', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type: 'RESET_PERSON', name })
+        });
+      } catch (e) {}
     }
   };
 
   const handleResetAll = async () => {
     if (!window.confirm('Yakin mau reset SEMUA hitungan scam hari ini?')) return;
-    try {
-      await fetch('/api/scam', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'RESET' })
-      });
-    } catch (e) {
-      setCounts({ Rifqi: 0, Ilham: 0, Jonathan: 0, Fatwa: 0, Agung: 0, Dini: 0 });
-      setLogs([]);
+    const newCounts = { Rifqi: 0, Ilham: 0, Jonathan: 0, Fatwa: 0, Agung: 0, Dini: 0 };
+    const newLogs = [];
+
+    updateGlobalState(newCounts, newLogs);
+
+    if (import.meta.env.DEV) {
+      try {
+        await fetch('/api/scam', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type: 'RESET' })
+        });
+      } catch (e) {}
     }
   };
 
@@ -308,10 +417,10 @@ function App() {
 
   return (
     <div className="container">
-      {/* Hidden Audio Player for DJ Mahjong Song */}
+      {/* Audio Player for DJ Mahjong Song */}
       <audio 
         ref={audioRef} 
-        src="/api/king-song.mp3" 
+        src={audioSrc} 
         preload="auto"
       />
 
@@ -344,7 +453,7 @@ function App() {
               borderColor: isPlayingMusic ? '#F59E0B' : 'rgba(255, 255, 255, 0.1)'
             }}
           >
-            {isPlayingMusic ? '🎵 DJ Mahjong (Main 10dtk 🔊)' : '🔇 Putar 10dtk DJ Mahjong'}
+            {isPlayingMusic ? '🎵 DJ Mahjong (Main 10dtk 🔊)' : '🔊 Putar 10dtk DJ Mahjong'}
           </button>
 
           <button onClick={handleResetAll} className="btn-reset">
